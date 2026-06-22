@@ -2876,6 +2876,220 @@ mod test_serde {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AWS Elastic Fabric Adapter (EFA) support, behind the `efa` feature.
+//
+// EFA's transport is SRD (Scalable Reliable Datagram): reliable like RC but connectionless and
+// addressed like UD (an address handle plus the remote QP number and Q_Key per send). SRD queue
+// pairs are created through the provider's direct-verbs (`efadv_create_qp_ex`) and posted to through
+// the extended "doorbell" work-request API (`ibv_qp_to_qp_ex` + `wr_*`), not the legacy
+// `ibv_post_send`. Completions are ordinary `ibv_wc`s polled from a normal completion queue.
+//
+// This reuses the existing `QueuePair`, `AddressHandle`, and completion-queue machinery; only queue
+// pair creation and the send path are EFA-specific.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "efa")]
+impl ProtectionDomain {
+    /// Begin building an EFA SRD queue pair associated with this protection domain.
+    ///
+    /// This returns the same [`QueuePairBuilder`] used for other transports (so the queue/SGE limits
+    /// and GID index are configured the same way), but the queue pair must be created with
+    /// [`build_srd`](QueuePairBuilder::build_srd) and activated with
+    /// [`activate_srd`](PreparedQueuePair::activate_srd) rather than `build`/`handshake`.
+    pub fn create_srd_qp(
+        &self,
+        send: &CompletionQueue,
+        recv: &CompletionQueue,
+    ) -> io::Result<QueuePairBuilder> {
+        self.create_qp(send, recv, ffi::ibv_qp_type::IBV_QPT_DRIVER)
+    }
+}
+
+#[cfg(feature = "efa")]
+impl QueuePairBuilder {
+    /// Create the EFA SRD queue pair described by this builder (`efadv_create_qp_ex`).
+    ///
+    /// The queue pair is created with the extended send operations enabled (send, RDMA write, RDMA
+    /// read, and their immediate variants) so it can be driven through the doorbell post API. After
+    /// this, transition it to ready with [`activate_srd`](PreparedQueuePair::activate_srd).
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in the queue pair attributes.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    pub fn build_srd(&self) -> io::Result<PreparedQueuePair> {
+        let send_ops_flags = ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_SEND.0
+            | ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_SEND_WITH_IMM.0
+            | ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE.0
+            | ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0
+            | ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_READ.0;
+
+        // `ibv_qp_init_attr_ex` has an `ibv_qp_type` field with no zero variant, so it cannot be
+        // zero-initialized as a Rust value. We zero the storage, write only the fields we use, and
+        // hand the pointer straight to C without `assume_init`, so the untouched (zeroed) fields,
+        // such as `rx_hash_conf`, never become a Rust value.
+        let mut attr = std::mem::MaybeUninit::<ffi::ibv_qp_init_attr_ex>::zeroed();
+        let p = attr.as_mut_ptr();
+        unsafe {
+            (*p).qp_context = ptr::null::<c_void>().offset(self.ctx) as *mut _;
+            (*p).send_cq = self.send.cq;
+            (*p).recv_cq = self.recv.cq;
+            (*p).cap = ffi::ibv_qp_cap {
+                max_send_wr: self.max_send_wr,
+                max_recv_wr: self.max_recv_wr,
+                max_send_sge: self.max_send_sge,
+                max_recv_sge: self.max_recv_sge,
+                max_inline_data: self.max_inline_data,
+            };
+            (*p).qp_type = ffi::ibv_qp_type::IBV_QPT_DRIVER;
+            (*p).comp_mask = (ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD
+                | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS)
+                .0;
+            (*p).pd = self.pd.pd;
+            (*p).send_ops_flags = send_ops_flags as u64;
+        }
+
+        let mut efa_attr = ffi::efadv_qp_init_attr {
+            comp_mask: 0,
+            driver_qp_type: ffi::EFADV_QP_DRIVER_TYPE_SRD as u32,
+            flags: 0,
+            sl: 0,
+            reserved: 0,
+        };
+
+        let qp = unsafe {
+            ffi::efadv_create_qp_ex(
+                self.pd.ctx.ctx,
+                attr.as_mut_ptr(),
+                &mut efa_attr as *mut _,
+                std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
+            )
+        };
+        if qp.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(PreparedQueuePair {
+            lid: self.port_attr.lid,
+            qp: QueuePair {
+                pd: self.pd.clone(),
+                _srq: None,
+                _send_cq: self.send.clone(),
+                _recv_cq: self.recv.clone(),
+                qp,
+            },
+            gid_index: self.gid_index,
+            traffic_class: self.traffic_class,
+            access: None,
+            timeout: None,
+            retry_count: None,
+            rnr_retry: None,
+            min_rnr_timer: None,
+            max_rd_atomic: None,
+            max_dest_rd_atomic: None,
+            path_mtu: None,
+            rq_psn: None,
+            service_level: self.service_level,
+        })
+    }
+}
+
+#[cfg(feature = "efa")]
+impl PreparedQueuePair {
+    /// Transition an EFA SRD queue pair to ready (`INIT` -> `RTR` -> `RTS`) with the given Q_Key.
+    ///
+    /// SRD is connectionless, so this needs no remote endpoint; the destination is supplied per send
+    /// through an [`AddressHandle`]. The transitions are the same as a UD queue pair's.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in `attr` or `attr_mask`.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    pub fn activate_srd(self, qkey: u32) -> io::Result<QueuePair> {
+        self.activate_ud(qkey)
+    }
+}
+
+#[cfg(feature = "efa")]
+impl QueuePair {
+    /// Drive one signaled doorbell work request on an SRD queue pair: open it, stamp the id, let
+    /// `set_op` select the opcode, then set the UD address and scatter/gather list and close it.
+    ///
+    /// # Safety
+    ///
+    /// `self` must be an SRD queue pair (see [`QueuePairBuilder::build_srd`]), and the local memory
+    /// slices must stay valid until a work completion is polled for `wr_id`.
+    unsafe fn post_srd(
+        &mut self,
+        local: &[LocalMemorySlice],
+        ah: &AddressHandle,
+        remote_qpn: u32,
+        remote_qkey: u32,
+        wr_id: u64,
+        set_op: impl FnOnce(*mut ffi::ibv_qp_ex),
+    ) -> io::Result<()> {
+        let qpx = ffi::ibv_qp_to_qp_ex(self.qp);
+        assert!(
+            !qpx.is_null(),
+            "queue pair does not support the extended API"
+        );
+
+        (*qpx).wr_start.unwrap()(qpx);
+        (*qpx).wr_id = wr_id;
+        (*qpx).wr_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+        set_op(qpx);
+        (*qpx).wr_set_ud_addr.unwrap()(qpx, ah.as_ptr(), remote_qpn, remote_qkey);
+        (*qpx).wr_set_sge_list.unwrap()(qpx, local.len(), local.as_ptr() as *const ffi::ibv_sge);
+        let ret = (*qpx).wr_complete.unwrap()(qpx);
+
+        if ret != 0 {
+            Err(io::Error::from_raw_os_error(ret))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Send `local` over an SRD queue pair to the destination addressed by `ah` / `remote_qpn` /
+    /// `remote_qkey`. The work request is signaled.
+    ///
+    /// # Safety
+    ///
+    /// See [`post_srd`](Self::post_srd).
+    pub unsafe fn post_send_srd(
+        &mut self,
+        local: &[LocalMemorySlice],
+        ah: &AddressHandle,
+        remote_qpn: u32,
+        remote_qkey: u32,
+        wr_id: u64,
+    ) -> io::Result<()> {
+        self.post_srd(local, ah, remote_qpn, remote_qkey, wr_id, |qpx| unsafe {
+            (*qpx).wr_send.unwrap()(qpx)
+        })
+    }
+
+    /// RDMA-write `local` into the remote region `remote` over an SRD queue pair, addressed by `ah`
+    /// / `remote_qpn` / `remote_qkey`. The work request is signaled.
+    ///
+    /// # Safety
+    ///
+    /// See [`post_srd`](Self::post_srd).
+    pub unsafe fn post_write_srd(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        ah: &AddressHandle,
+        remote_qpn: u32,
+        remote_qkey: u32,
+        wr_id: u64,
+    ) -> io::Result<()> {
+        self.post_srd(local, ah, remote_qpn, remote_qkey, wr_id, |qpx| unsafe {
+            (*qpx).wr_rdma_write.unwrap()(qpx, remote.rkey, remote.addr)
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
