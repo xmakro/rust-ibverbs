@@ -56,6 +56,42 @@ pub struct ibv_wc {
 
 #[allow(clippy::len_without_is_empty)]
 impl ibv_wc {
+    /// Construct a work completion from fields read individually through the extended completion
+    /// queue interface (`ibv_cq_ex`). Used by the crate's extended-verbs completion path; the
+    /// `ibv_cq_ex` reader functions only populate `pkey_index` for GSI QPs, so it defaults to 0.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_ex_parts(
+        wr_id: u64,
+        status: ibv_wc_status,
+        opcode: ibv_wc_opcode,
+        vendor_err: u32,
+        byte_len: u32,
+        imm_data: u32,
+        qp_num: u32,
+        src_qp: u32,
+        wc_flags: ibv_wc_flags,
+        slid: u16,
+        sl: u8,
+        dlid_path_bits: u8,
+    ) -> Self {
+        ibv_wc {
+            wr_id,
+            status,
+            opcode,
+            vendor_err,
+            byte_len,
+            imm_data,
+            qp_num,
+            src_qp,
+            wc_flags,
+            pkey_index: 0,
+            slid,
+            sl,
+            dlid_path_bits,
+        }
+    }
+
     /// Returns the 64 bit value that was associated with the corresponding Work Request.
     pub fn wr_id(&self) -> u64 {
         self.wr_id
@@ -340,5 +376,64 @@ impl Default for ibv_wc {
             sl: 0,
             dlid_path_bits: 0,
         }
+    }
+}
+
+// `ibv_create_cq_ex` and `ibv_create_qp_ex` are `static inline` in verbs.h: they reach the provider
+// through the op table embedded in `verbs_context`, so there is no exported symbol for bindgen to
+// bind. The functions below reimplement that dispatch (the `verbs_get_ctx` container_of and the
+// `verbs_get_ctx_op` availability check) so the crate can create extended queue pairs and
+// completion queues.
+
+/// Recover the `verbs_context` that embeds `context` as its last field.
+///
+/// # Safety
+///
+/// `context` must be a valid `ibv_context` returned by libibverbs (every such context is embedded
+/// in a `verbs_context`).
+#[inline]
+unsafe fn verbs_get_ctx(context: *mut ibv_context) -> *mut verbs_context {
+    (context as *mut u8).sub(::std::mem::offset_of!(verbs_context, context)) as *mut verbs_context
+}
+
+/// Create an extended completion queue (`ibv_create_cq_ex`).
+///
+/// Returns null if the provider does not implement the extended verb (matching the C inline).
+///
+/// # Safety
+///
+/// `context` and `cq_attr` must be valid pointers for an `ibv_create_cq_ex` call.
+#[inline]
+pub unsafe fn ibv_create_cq_ex(
+    context: *mut ibv_context,
+    cq_attr: *mut ibv_cq_init_attr_ex,
+) -> *mut ibv_cq_ex {
+    let vctx = verbs_get_ctx(context);
+    let need = ::std::mem::size_of::<verbs_context>()
+        - ::std::mem::offset_of!(verbs_context, create_cq_ex);
+    match (*vctx).create_cq_ex {
+        Some(create_cq_ex) if (*vctx).sz >= need => create_cq_ex(context, cq_attr),
+        _ => ::std::ptr::null_mut(),
+    }
+}
+
+/// Create an extended queue pair (`ibv_create_qp_ex`).
+///
+/// Returns null if the provider does not implement the extended verb (matching the C inline).
+///
+/// # Safety
+///
+/// `context` and `qp_attr` must be valid pointers for an `ibv_create_qp_ex` call.
+#[inline]
+pub unsafe fn ibv_create_qp_ex(
+    context: *mut ibv_context,
+    qp_attr: *mut ibv_qp_init_attr_ex,
+) -> *mut ibv_qp {
+    let vctx = verbs_get_ctx(context);
+    let need = ::std::mem::size_of::<verbs_context>()
+        - ::std::mem::offset_of!(verbs_context, create_qp_ex);
+    match (*vctx).create_qp_ex {
+        Some(create_qp_ex) if (*vctx).sz >= need => create_qp_ex(context, qp_attr),
+        _ => ::std::ptr::null_mut(),
     }
 }

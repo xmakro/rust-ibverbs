@@ -438,24 +438,37 @@ impl Context {
         );
         nix::fcntl::fcntl(cc_fd, arg)?;
 
-        let cq = unsafe {
-            ffi::ibv_create_cq(
-                self.inner.ctx,
-                min_cq_entries,
-                ptr::null::<c_void>().offset(id) as *mut _,
-                cc,
-                0,
-            )
-        };
+        // Request the standard set of work-completion fields so that `poll` can reconstruct the
+        // same `ibv_wc` the legacy path produced. Optional fields (timestamps, CVLAN, ...) are not
+        // requested, since not every provider supports them.
+        let wc_flags = ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_BYTE_LEN.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_IMM.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_QP_NUM.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_DLID_PATH_BITS.0;
 
-        if cq.is_null() {
+        let mut cq_attr = ffi::ibv_cq_init_attr_ex {
+            cqe: min_cq_entries as u32,
+            cq_context: unsafe { ptr::null::<c_void>().offset(id) } as *mut _,
+            channel: cc,
+            comp_vector: 0,
+            wc_flags: wc_flags as u64,
+            comp_mask: 0,
+            flags: 0,
+            parent_domain: ptr::null_mut(),
+        };
+        let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.inner.ctx, &mut cq_attr as *mut _) };
+
+        if cq_ex.is_null() {
             Err(io::Error::last_os_error())
         } else {
             Ok(CompletionQueue {
                 inner: Arc::new(CompletionQueueInner {
                     _ctx: self.inner.clone(),
                     cc,
-                    cq,
+                    cq_ex,
                 }),
             })
         }
@@ -509,13 +522,47 @@ impl Context {
 
 struct CompletionQueueInner {
     _ctx: Arc<ContextInner>,
-    cq: *mut ffi::ibv_cq,
+    cq_ex: *mut ffi::ibv_cq_ex,
     cc: *mut ffi::ibv_comp_channel,
+}
+
+impl CompletionQueueInner {
+    /// The underlying `ibv_cq`. An `ibv_cq_ex` shares its layout prefix with `ibv_cq`, so this is
+    /// just a pointer cast (exactly what `ibv_cq_ex_to_cq` does in C). Used for the verbs that still
+    /// take a plain `ibv_cq`: queue-pair creation, completion-event notification, and teardown.
+    #[inline]
+    fn cq(&self) -> *mut ffi::ibv_cq {
+        self.cq_ex as *mut ffi::ibv_cq
+    }
+}
+
+/// Read the completion the extended CQ is currently positioned on into the crate's `ibv_wc`.
+///
+/// # Safety
+///
+/// `cq` must point at a valid `ibv_cq_ex` positioned on a completion (i.e. the most recent
+/// `start_poll`/`next_poll` returned success), created requesting the fields read below.
+#[inline]
+unsafe fn read_completion(cq: *mut ffi::ibv_cq_ex) -> ffi::ibv_wc {
+    ffi::ibv_wc::from_ex_parts(
+        (*cq).wr_id,
+        (*cq).status,
+        (*cq).read_opcode.unwrap()(cq),
+        (*cq).read_vendor_err.unwrap()(cq),
+        (*cq).read_byte_len.unwrap()(cq),
+        (*cq).read_imm_data.unwrap()(cq),
+        (*cq).read_qp_num.unwrap()(cq),
+        (*cq).read_src_qp.unwrap()(cq),
+        ffi::ibv_wc_flags((*cq).read_wc_flags.unwrap()(cq)),
+        (*cq).read_slid.unwrap()(cq) as u16,
+        (*cq).read_sl.unwrap()(cq),
+        (*cq).read_dlid_path_bits.unwrap()(cq),
+    )
 }
 
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
+        let errno = unsafe { ffi::ibv_destroy_cq(self.cq()) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{e}");
@@ -575,21 +622,42 @@ impl CompletionQueue {
         //   (hold more Work Completions than the CQ size). In case of an CQ overrun, the async
         //   event `IBV_EVENT_CQ_ERR` will be triggered, and the CQ cannot be used anymore.
         //
-        let ctx: *mut ffi::ibv_context = unsafe { &*self.inner.cq }.context;
-        let ops = &mut unsafe { &mut *ctx }.ops;
-        let n = unsafe {
-            ops.poll_cq.as_mut().unwrap()(
-                self.inner.cq,
-                completions.len() as i32,
-                completions.as_mut_ptr(),
-            )
-        };
-
-        if n < 0 {
-            Err(io::Error::other("ibv_poll_cq failed"))
-        } else {
-            Ok(&mut completions[0..n as usize])
+        if completions.is_empty() {
+            return Ok(&mut completions[..0]);
         }
+
+        let cq = self.inner.cq_ex;
+        let mut attr = ffi::ibv_poll_cq_attr { comp_mask: 0 };
+
+        // `start_poll` returns ENOENT when the CQ is empty (and in that case must not be paired with
+        // `end_poll`). On success it positions the CQ on the first completion; `next_poll` advances,
+        // and `end_poll` releases the CQ once we are done reading.
+        let rc = unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) };
+        if rc == nix::libc::ENOENT {
+            return Ok(&mut completions[..0]);
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+
+        let mut n = 0;
+        loop {
+            completions[n] = unsafe { read_completion(cq) };
+            n += 1;
+            if n == completions.len() {
+                break;
+            }
+            let rc = unsafe { (*cq).next_poll.unwrap()(cq) };
+            if rc == nix::libc::ENOENT {
+                break;
+            }
+            if rc != 0 {
+                unsafe { (*cq).end_poll.unwrap()(cq) };
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+        }
+        unsafe { (*cq).end_poll.unwrap()(cq) };
+        Ok(&mut completions[..n])
     }
 
     /// Waits for one or more work completions in a Completion Queue (CQ).
@@ -623,10 +691,10 @@ impl CompletionQueue {
             // self, Drop has not been called. The context is guaranteed to not have been destroyed
             // because the `CompletionQueue` holds a reference to the `Context` and we only destroy
             // the context in Drop implementation of the `Context`.
-            let ctx = unsafe { *self.inner.cq }.context;
+            let ctx = unsafe { *self.inner.cq() }.context;
             let errno = unsafe {
                 let ops = &mut { &mut *ctx }.ops;
-                ops.req_notify_cq.as_mut().unwrap()(self.inner.cq, 0)
+                ops.req_notify_cq.as_mut().unwrap()(self.inner.cq(), 0)
             };
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
@@ -680,13 +748,13 @@ impl CompletionQueue {
                 return Err(e);
             }
 
-            assert_eq!(self.inner.cq, out_cq);
+            assert_eq!(self.inner.cq(), out_cq);
             // cq_context is the opaque user defined identifier passed to `ibv_create_cq()`.
             assert!(out_cq_context.is_null());
 
             // All completion events returned by ibv_get_cq_event() must eventually be acknowledged with ibv_ack_cq_events().
             // SAFETY: c ffi call
-            unsafe { ffi::ibv_ack_cq_events(self.inner.cq, 1) };
+            unsafe { ffi::ibv_ack_cq_events(self.inner.cq(), 1) };
         }
     }
 }
@@ -1127,8 +1195,8 @@ impl QueuePairBuilder {
     pub fn build(&self) -> io::Result<PreparedQueuePair> {
         let mut attr = ffi::ibv_qp_init_attr {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
-            send_cq: self.send.cq as *const _ as *mut _,
-            recv_cq: self.recv.cq as *const _ as *mut _,
+            send_cq: self.send.cq(),
+            recv_cq: self.recv.cq(),
             srq: self
                 .srq
                 .as_ref()
