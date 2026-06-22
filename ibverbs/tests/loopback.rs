@@ -560,3 +560,35 @@ fn shared_receive_queue() {
     // Destroy the queue pair before the CQ/SRQ/PD it depends on, to avoid an EBUSY panic in `Drop`.
     drop(qp);
 }
+
+/// Drive completions through the lending-iterator API (`start_poll`) directly, reading fields
+/// lazily, rather than the `poll(&mut [ibv_wc])` convenience wrapper.
+#[test]
+fn poll_iterator() {
+    require_device!("poll_iterator");
+    let mut lb = loopback().expect("device requested but loopback not set up");
+
+    let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
+    let mut send = lb.pd.allocate(64).expect("failed to register send MR");
+    send.inner_mut()[..5].copy_from_slice(b"iter!");
+
+    unsafe { lb.qp.post_receive(&[recv.slice(..5)], 1) }.expect("post_receive failed");
+    unsafe { lb.qp.post_send(&[send.slice(..5)], 2) }.expect("post_send failed");
+
+    let mut ids = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ids.len() < 2 {
+        if let Some(mut completions) = lb.cq.start_poll().expect("start_poll failed") {
+            while let Some(wc) = completions.next() {
+                assert!(wc.error().is_none(), "work request {} failed", wc.wr_id());
+                ids.push(wc.wr_id());
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out: got {ids:?}");
+    }
+    assert!(
+        ids.contains(&1) && ids.contains(&2),
+        "missing completions: {ids:?}"
+    );
+    assert_eq!(&recv.inner_mut()[..5], b"iter!");
+}

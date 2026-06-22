@@ -536,28 +536,138 @@ impl CompletionQueueInner {
     }
 }
 
-/// Read the completion the extended CQ is currently positioned on into the crate's `ibv_wc`.
+/// A single work completion, borrowed from the completion queue being polled.
 ///
-/// # Safety
+/// Returned by [`Completions::next`]. Fields are read lazily through the extended completion-queue
+/// interface, so you only pay for the ones you access (`wr_id` and `status` are plain reads; the
+/// rest dispatch to the provider). The handle borrows the [`Completions`] iterator, so it must be
+/// dropped before advancing — the underlying completion data is only valid until then.
+pub struct WorkCompletion<'iter> {
+    cq: *mut ffi::ibv_cq_ex,
+    _iter: std::marker::PhantomData<&'iter ()>,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl WorkCompletion<'_> {
+    /// The `wr_id` of the corresponding work request.
+    #[inline]
+    pub fn wr_id(&self) -> u64 {
+        unsafe { (*self.cq).wr_id }
+    }
+
+    /// Whether the work request completed successfully (`IBV_WC_SUCCESS`).
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        unsafe { (*self.cq).status == ffi::ibv_wc_status::IBV_WC_SUCCESS }
+    }
+
+    /// The completion status and vendor error syndrome, if the work request did not succeed.
+    #[inline]
+    pub fn error(&self) -> Option<(ffi::ibv_wc_status, u32)> {
+        match unsafe { (*self.cq).status } {
+            ffi::ibv_wc_status::IBV_WC_SUCCESS => None,
+            status => Some((status, unsafe {
+                (*self.cq).read_vendor_err.unwrap()(self.cq)
+            })),
+        }
+    }
+
+    /// The operation the corresponding work request performed.
+    #[inline]
+    pub fn opcode(&self) -> ffi::ibv_wc_opcode {
+        unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }
+    }
+
+    /// The number of bytes transferred.
+    #[inline]
+    pub fn len(&self) -> usize {
+        unsafe { (*self.cq).read_byte_len.unwrap()(self.cq) as usize }
+    }
+
+    /// The immediate data, if present. Network byte order, as with [`ibv_wc::imm_data`].
+    #[inline]
+    pub fn imm_data(&self) -> Option<u32> {
+        let flags = ffi::ibv_wc_flags(unsafe { (*self.cq).read_wc_flags.unwrap()(self.cq) });
+        if self.is_valid() && (flags & ffi::ibv_wc_flags::IBV_WC_WITH_IMM).0 != 0 {
+            Some(unsafe { (*self.cq).read_imm_data.unwrap()(self.cq) })
+        } else {
+            None
+        }
+    }
+
+    /// The local QP number of the completed work request.
+    #[inline]
+    pub fn qp_num(&self) -> u32 {
+        unsafe { (*self.cq).read_qp_num.unwrap()(self.cq) }
+    }
+
+    /// The source (remote) QP number. Relevant for receive completions on a UD QP.
+    #[inline]
+    pub fn src_qp(&self) -> u32 {
+        unsafe { (*self.cq).read_src_qp.unwrap()(self.cq) }
+    }
+
+    /// Copy this completion into an owned [`ibv_wc`] (reads every standard field). Used by the
+    /// convenience [`CompletionQueue::poll`] wrapper.
+    #[inline]
+    fn to_wc(&self) -> ffi::ibv_wc {
+        let cq = self.cq;
+        unsafe {
+            ffi::ibv_wc::from_ex_parts(
+                (*cq).wr_id,
+                (*cq).status,
+                (*cq).read_opcode.unwrap()(cq),
+                (*cq).read_vendor_err.unwrap()(cq),
+                (*cq).read_byte_len.unwrap()(cq),
+                (*cq).read_imm_data.unwrap()(cq),
+                (*cq).read_qp_num.unwrap()(cq),
+                (*cq).read_src_qp.unwrap()(cq),
+                ffi::ibv_wc_flags((*cq).read_wc_flags.unwrap()(cq)),
+                (*cq).read_slid.unwrap()(cq) as u16,
+                (*cq).read_sl.unwrap()(cq),
+                (*cq).read_dlid_path_bits.unwrap()(cq),
+            )
+        }
+    }
+}
+
+/// An in-progress poll of a [`CompletionQueue`], yielding work completions one at a time.
 ///
-/// `cq` must point at a valid `ibv_cq_ex` positioned on a completion (i.e. the most recent
-/// `start_poll`/`next_poll` returned success), created requesting the fields read below.
-#[inline]
-unsafe fn read_completion(cq: *mut ffi::ibv_cq_ex) -> ffi::ibv_wc {
-    ffi::ibv_wc::from_ex_parts(
-        (*cq).wr_id,
-        (*cq).status,
-        (*cq).read_opcode.unwrap()(cq),
-        (*cq).read_vendor_err.unwrap()(cq),
-        (*cq).read_byte_len.unwrap()(cq),
-        (*cq).read_imm_data.unwrap()(cq),
-        (*cq).read_qp_num.unwrap()(cq),
-        (*cq).read_src_qp.unwrap()(cq),
-        ffi::ibv_wc_flags((*cq).read_wc_flags.unwrap()(cq)),
-        (*cq).read_slid.unwrap()(cq) as u16,
-        (*cq).read_sl.unwrap()(cq),
-        (*cq).read_dlid_path_bits.unwrap()(cq),
-    )
+/// Created by [`CompletionQueue::start_poll`]. This is a *lending* iterator: each
+/// [`WorkCompletion`] borrows the `Completions`, so it must be dropped before the next
+/// [`next`](Completions::next) call (which is why it cannot implement [`Iterator`]). The completion
+/// queue is released (`ibv_end_poll`) when the `Completions` is dropped.
+#[must_use]
+pub struct Completions<'cq> {
+    cq: *mut ffi::ibv_cq_ex,
+    first: bool,
+    _cq: std::marker::PhantomData<&'cq CompletionQueueInner>,
+}
+
+impl Completions<'_> {
+    /// Return the next work completion, or `None` once the queue has no more.
+    ///
+    /// Consume with `while let Some(wc) = completions.next() { ... }`.
+    #[allow(clippy::should_implement_trait)]
+    #[inline]
+    pub fn next(&mut self) -> Option<WorkCompletion<'_>> {
+        if self.first {
+            self.first = false;
+        } else if unsafe { (*self.cq).next_poll.unwrap()(self.cq) } != 0 {
+            // ENOENT (no more) or an error: either way the poll is finished.
+            return None;
+        }
+        Some(WorkCompletion {
+            cq: self.cq,
+            _iter: std::marker::PhantomData,
+        })
+    }
+}
+
+impl Drop for Completions<'_> {
+    fn drop(&mut self) {
+        unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
+    }
 }
 
 impl Drop for CompletionQueueInner {
@@ -626,38 +736,56 @@ impl CompletionQueue {
             return Ok(&mut completions[..0]);
         }
 
+        let mut n = 0;
+        if let Some(mut polled) = self.start_poll()? {
+            while let Some(wc) = polled.next() {
+                completions[n] = wc.to_wc();
+                n += 1;
+                if n == completions.len() {
+                    break;
+                }
+            }
+        }
+        Ok(&mut completions[..n])
+    }
+
+    /// Begin polling for work completions through the extended interface.
+    ///
+    /// Returns `None` if the queue is currently empty. The returned [`Completions`] is a lending
+    /// iterator whose [`WorkCompletion`]s read their fields lazily, so this is the efficient path
+    /// when you only need a few fields. [`poll`](Self::poll) is a convenience wrapper around this
+    /// that copies whole completions into a caller-provided buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ibverbs::CompletionQueue;
+    /// # fn drain(cq: &CompletionQueue) -> std::io::Result<()> {
+    /// if let Some(mut completions) = cq.start_poll()? {
+    ///     while let Some(wc) = completions.next() {
+    ///         if let Some((status, _)) = wc.error() {
+    ///             eprintln!("work request {} failed: {status:?}", wc.wr_id());
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn start_poll(&self) -> io::Result<Option<Completions<'_>>> {
         let cq = self.inner.cq_ex;
         let mut attr = ffi::ibv_poll_cq_attr { comp_mask: 0 };
-
-        // `start_poll` returns ENOENT when the CQ is empty (and in that case must not be paired with
-        // `end_poll`). On success it positions the CQ on the first completion; `next_poll` advances,
-        // and `end_poll` releases the CQ once we are done reading.
-        let rc = unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) };
-        if rc == nix::libc::ENOENT {
-            return Ok(&mut completions[..0]);
+        // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
+        // paired with `end_poll`) when the queue is empty.
+        match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
+            0 => Ok(Some(Completions {
+                cq,
+                first: true,
+                _cq: std::marker::PhantomData,
+            })),
+            e if e == nix::libc::ENOENT => Ok(None),
+            e => Err(io::Error::from_raw_os_error(e)),
         }
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc));
-        }
-
-        let mut n = 0;
-        loop {
-            completions[n] = unsafe { read_completion(cq) };
-            n += 1;
-            if n == completions.len() {
-                break;
-            }
-            let rc = unsafe { (*cq).next_poll.unwrap()(cq) };
-            if rc == nix::libc::ENOENT {
-                break;
-            }
-            if rc != 0 {
-                unsafe { (*cq).end_poll.unwrap()(cq) };
-                return Err(io::Error::from_raw_os_error(rc));
-            }
-        }
-        unsafe { (*cq).end_poll.unwrap()(cq) };
-        Ok(&mut completions[..n])
     }
 
     /// Waits for one or more work completions in a Completion Queue (CQ).
