@@ -13,7 +13,10 @@
 
 use std::time::{Duration, Instant};
 
-use ibverbs::{ibv_qp_type, CompletionQueue, Context, ProtectionDomain, QueuePair, WorkRequest};
+use ibverbs::{
+    ibv_access_flags, ibv_qp_type, CompletionQueue, Context, ProtectionDomain, QueuePair,
+    WorkRequest,
+};
 
 /// A queue pair connected to itself, together with the resources that must outlive it.
 struct Loopback {
@@ -66,9 +69,19 @@ fn loopback_of(qp_type: ibv_qp_type) -> Option<Loopback> {
         .set_max_recv_wr(16)
         .set_max_send_sge(4)
         .set_max_recv_sge(4);
-    // Self-loopback one-sided ops (RDMA read/write) target this same QP, so it must grant remote
-    // access. Only valid for RC/UC; a no-op otherwise.
-    builder.allow_remote_rw();
+    // Self-loopback one-sided ops target this same QP, so it must grant remote access. RC also
+    // needs remote-atomic access for the atomic test; allow_remote_rw covers UC (and is a no-op for
+    // UD).
+    if qp_type == ibv_qp_type::IBV_QPT_RC {
+        builder.set_access(
+            ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+                | ibv_access_flags::IBV_ACCESS_REMOTE_READ
+                | ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC,
+        );
+    } else {
+        builder.allow_remote_rw();
+    }
 
     let prepared = builder.build().expect("failed to build queue pair");
     let endpoint = prepared.endpoint().expect("failed to read local endpoint");
@@ -117,6 +130,11 @@ fn drain(cq: &CompletionQueue, n: usize) -> Vec<ibverbs::ibv_wc> {
             observed.len()
         );
     }
+}
+
+/// Read the first 8 bytes of a buffer as a native-endian `u64` (for inspecting atomic results).
+fn first_u64(bytes: &[u8]) -> u64 {
+    u64::from_ne_bytes(bytes[..8].try_into().unwrap())
 }
 
 /// Print a skip notice and return when `IBVERBS_TEST_DEVICE` is not set.
@@ -292,6 +310,77 @@ fn rdma_read() {
     let comps = drain(&lb.cq, 1);
     assert_eq!(comps[0].wr_id(), 1);
     assert_eq!(&local.inner_mut()[..8], &[9, 8, 7, 6, 5, 4, 3, 2]);
+}
+
+/// Atomic compare-and-swap and fetch-and-add against a remote 8-byte value.
+///
+/// RDMA atomics operate on 8-byte, 8-byte-aligned values, and their wire byte order is
+/// implementation-defined, so the assertions are written to be byte-order agnostic (compared
+/// against zero, or accepting either endianness of a stored value).
+#[test]
+fn atomic_operations() {
+    require_device!("atomic_operations");
+    let mut lb = loopback().expect("device requested but loopback not set up");
+
+    let mut target = lb.pd.allocate(8).expect("failed to register target MR");
+    let mut local = lb.pd.allocate(8).expect("failed to register local MR");
+
+    // Compare-and-swap on a zeroed target: 0 == 0 in any byte order, so the swap succeeds and the
+    // original value (0) is returned into `local`.
+    let swapped = 0x1122_3344_5566_7788_u64;
+    let remote = target.remote().slice(..8);
+    unsafe {
+        lb.qp
+            .post_atomic_cmp_swap(&[local.slice(..8)], remote, 0, swapped, 1)
+    }
+    .expect("post_atomic_cmp_swap failed");
+    assert_eq!(drain(&lb.cq, 1)[0].wr_id(), 1);
+    assert_eq!(
+        first_u64(local.inner_mut()),
+        0,
+        "CAS must return the original value"
+    );
+    let stored = first_u64(target.inner_mut());
+    assert!(
+        stored == swapped || stored == swapped.swap_bytes(),
+        "CAS must store the swap value (in some byte order)"
+    );
+
+    // A mismatching compare leaves the target unchanged and returns its current value.
+    let remote = target.remote().slice(..8);
+    unsafe {
+        lb.qp
+            .post_atomic_cmp_swap(&[local.slice(..8)], remote, 0, 0, 2)
+    }
+    .expect("post_atomic_cmp_swap failed");
+    assert_eq!(drain(&lb.cq, 1)[0].wr_id(), 2);
+    assert_eq!(
+        first_u64(target.inner_mut()),
+        stored,
+        "mismatching CAS must not modify the target"
+    );
+    assert_eq!(
+        first_u64(local.inner_mut()),
+        stored,
+        "mismatching CAS returns the current value"
+    );
+
+    // Fetch-and-add on a fresh zeroed counter returns the original (0) and adds.
+    let mut counter = lb.pd.allocate(8).expect("failed to register counter MR");
+    let remote = counter.remote().slice(..8);
+    unsafe {
+        lb.qp
+            .post_atomic_fetch_add(&[local.slice(..8)], remote, 5, 3)
+    }
+    .expect("post_atomic_fetch_add failed");
+    assert_eq!(drain(&lb.cq, 1)[0].wr_id(), 3);
+    assert_eq!(
+        first_u64(local.inner_mut()),
+        0,
+        "fetch-add must return the original value"
+    );
+    let sum = first_u64(counter.inner_mut());
+    assert!(sum == 5 || sum == 5u64.swap_bytes(), "fetch-add must add 5");
 }
 
 /// Batched posting: a single `post` call chains an (unsignaled) RDMA write followed by a signaled

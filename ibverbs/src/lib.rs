@@ -1193,27 +1193,54 @@ impl QueuePairBuilder {
     ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
     pub fn build(&self) -> io::Result<PreparedQueuePair> {
-        let mut attr = ffi::ibv_qp_init_attr {
-            qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
-            send_cq: self.send.cq(),
-            recv_cq: self.recv.cq(),
-            srq: self
-                .srq
-                .as_ref()
-                .map(|s| s.inner.srq)
-                .unwrap_or(ptr::null_mut()),
-            cap: ffi::ibv_qp_cap {
-                max_send_wr: self.max_send_wr,
-                max_recv_wr: self.max_recv_wr,
-                max_send_sge: self.max_send_sge,
-                max_recv_sge: self.max_recv_sge,
-                max_inline_data: self.max_inline_data,
-            },
-            qp_type: self.qp_type,
-            sq_sig_all: 0,
-        };
+        // Declare which send operations this queue pair will issue through the extended interface.
+        // Only request what the transport supports, since requesting an unsupported op fails
+        // creation: UD is datagram send/receive only, UC adds RDMA write, RC adds read and atomics.
+        use ffi::ibv_qp_create_send_ops_flags as SendOps;
+        let mut send_ops_flags =
+            SendOps::IBV_QP_EX_WITH_SEND.0 | SendOps::IBV_QP_EX_WITH_SEND_WITH_IMM.0;
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
+            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
+        {
+            send_ops_flags |= SendOps::IBV_QP_EX_WITH_RDMA_WRITE.0
+                | SendOps::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0;
+        }
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
+            send_ops_flags |= SendOps::IBV_QP_EX_WITH_RDMA_READ.0
+                | SendOps::IBV_QP_EX_WITH_ATOMIC_CMP_AND_SWP.0
+                | SendOps::IBV_QP_EX_WITH_ATOMIC_FETCH_AND_ADD.0;
+        }
 
-        let qp = unsafe { ffi::ibv_create_qp(self.pd.pd, &mut attr as *mut _) };
+        // `ibv_qp_init_attr_ex` has many fields we do not use (XRC, TSO, RX hashing, ...). Zero the
+        // whole thing, then fill in what we need. It cannot be a plain `mem::zeroed()` because the
+        // `qp_type` enum has no zero variant, so set that first (making the value valid) before
+        // taking a reference to the rest.
+        let mut attr = std::mem::MaybeUninit::<ffi::ibv_qp_init_attr_ex>::zeroed();
+        unsafe {
+            ptr::addr_of_mut!((*attr.as_mut_ptr()).qp_type).write(self.qp_type);
+        }
+        let mut attr = unsafe { attr.assume_init() };
+        attr.qp_context = unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _;
+        attr.send_cq = self.send.cq();
+        attr.recv_cq = self.recv.cq();
+        attr.srq = self
+            .srq
+            .as_ref()
+            .map(|s| s.inner.srq)
+            .unwrap_or(ptr::null_mut());
+        attr.cap = ffi::ibv_qp_cap {
+            max_send_wr: self.max_send_wr,
+            max_recv_wr: self.max_recv_wr,
+            max_send_sge: self.max_send_sge,
+            max_recv_sge: self.max_recv_sge,
+            max_inline_data: self.max_inline_data,
+        };
+        attr.comp_mask = ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
+            | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0;
+        attr.pd = self.pd.pd;
+        attr.send_ops_flags = send_ops_flags as u64;
+
+        let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, &mut attr as *mut _) };
         if qp.is_null() {
             Err(io::Error::last_os_error())
         } else {
@@ -1222,6 +1249,9 @@ impl QueuePairBuilder {
                 qp: QueuePair {
                     pd: self.pd.clone(),
                     _srq: self.srq.clone(),
+                    _send_cq: self.send.clone(),
+                    _recv_cq: self.recv.clone(),
+                    qp_ex: unsafe { ffi::ibv_qp_to_qp_ex(qp) },
                     qp,
                 },
                 gid_index: self.gid_index,
@@ -2171,6 +2201,86 @@ impl<'local> WorkRequest<'local> {
         )
     }
 
+    // Helper to build atomic (compare-and-swap / fetch-and-add) work requests.
+    #[inline]
+    fn _atomic(
+        local: &'local [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        opcode: ffi::ibv_wr_opcode,
+        compare_add: u64,
+        swap: u64,
+    ) -> Self {
+        Self {
+            wr: ffi::ibv_send_wr {
+                wr_id,
+                next: ptr::null_mut(),
+                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+                num_sge: local.len() as i32,
+                opcode,
+                send_flags: 0,
+                wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                    atomic: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_2 {
+                        remote_addr: remote.addr,
+                        compare_add,
+                        swap,
+                        rkey: remote.rkey,
+                    },
+                },
+                qp_type: Default::default(),
+                __bindgen_anon_1: Default::default(),
+                __bindgen_anon_2: Default::default(),
+            },
+            _local: std::marker::PhantomData,
+        }
+    }
+
+    /// Create an atomic compare-and-swap work request (`IBV_WR_ATOMIC_CMP_AND_SWP`).
+    ///
+    /// Atomically compares the 8-byte value at `remote` against `compare` and, if they are equal,
+    /// writes `swap`. The original remote value is returned into `local`, which must be 8 bytes and
+    /// 8-byte aligned. Valid only for RC queue pairs, and the remote memory region must permit
+    /// `IBV_ACCESS_REMOTE_ATOMIC`.
+    #[inline]
+    pub fn atomic_cmp_swap(
+        local: &'local [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        compare: u64,
+        swap: u64,
+        wr_id: u64,
+    ) -> Self {
+        Self::_atomic(
+            local,
+            remote,
+            wr_id,
+            ffi::ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP,
+            compare,
+            swap,
+        )
+    }
+
+    /// Create an atomic fetch-and-add work request (`IBV_WR_ATOMIC_FETCH_AND_ADD`).
+    ///
+    /// Atomically adds `add` to the 8-byte value at `remote`, returning the original remote value
+    /// into `local`, which must be 8 bytes and 8-byte aligned. Valid only for RC queue pairs, and
+    /// the remote memory region must permit `IBV_ACCESS_REMOTE_ATOMIC`.
+    #[inline]
+    pub fn atomic_fetch_add(
+        local: &'local [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        add: u64,
+        wr_id: u64,
+    ) -> Self {
+        Self::_atomic(
+            local,
+            remote,
+            wr_id,
+            ffi::ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD,
+            add,
+            0,
+        )
+    }
+
     /// Set the `IBV_SEND_FENCE` flag.
     ///
     /// Prevents this Work Request from being processed until all prior RDMA Read and Atomic
@@ -2230,7 +2340,13 @@ impl<'local> WorkRequest<'local> {
 pub struct QueuePair {
     pd: Arc<ProtectionDomainInner>,
     _srq: Option<SharedReceiveQueue>,
+    // Keep the completion queues alive while the queue pair references them; `ibv_destroy_cq` fails
+    // with EBUSY if a queue pair is still attached.
+    _send_cq: Arc<CompletionQueueInner>,
+    _recv_cq: Arc<CompletionQueueInner>,
     qp: *mut ffi::ibv_qp,
+    /// The extended (doorbell) interface for `qp`, from `ibv_qp_to_qp_ex`. Sends go through this.
+    qp_ex: *mut ffi::ibv_qp_ex,
 }
 
 unsafe impl Send for QueuePair {}
@@ -2367,6 +2483,41 @@ impl QueuePair {
         self.post([WorkRequest::read(local, remote, wr_id).signaled()])
     }
 
+    /// Posts an atomic compare-and-swap. See [`WorkRequest::atomic_cmp_swap`]. The request is
+    /// signaled, so it generates a work completion.
+    ///
+    /// # Safety
+    ///
+    /// See [`post`](Self::post).
+    #[inline]
+    pub unsafe fn post_atomic_cmp_swap(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        compare: u64,
+        swap: u64,
+        wr_id: u64,
+    ) -> io::Result<()> {
+        self.post([WorkRequest::atomic_cmp_swap(local, remote, compare, swap, wr_id).signaled()])
+    }
+
+    /// Posts an atomic fetch-and-add. See [`WorkRequest::atomic_fetch_add`]. The request is
+    /// signaled, so it generates a work completion.
+    ///
+    /// # Safety
+    ///
+    /// See [`post`](Self::post).
+    #[inline]
+    pub unsafe fn post_atomic_fetch_add(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        add: u64,
+        wr_id: u64,
+    ) -> io::Result<()> {
+        self.post([WorkRequest::atomic_fetch_add(local, remote, add, wr_id).signaled()])
+    }
+
     /// Posts a linked list of Work Requests (WRs) to the Send Queue of this Queue Pair.
     ///
     /// This method modifies `wrs` to link the work requests together.
@@ -2452,39 +2603,93 @@ impl QueuePair {
             return Ok(());
         }
 
-        for i in 0..wrs.len() - 1 {
-            let next_ptr = &mut wrs[i + 1].wr as *mut ffi::ibv_send_wr;
-            wrs[i].wr.next = next_ptr;
+        // Drive the extended (doorbell) interface: open a work-request block, translate each
+        // `WorkRequest` into the matching `wr_*` op plus its scatter-gather (or inline) data, and
+        // post the whole block atomically with `wr_complete`. Inline data is requested through
+        // `wr_set_inline_data` rather than a send flag.
+        let qpx = self.qp_ex;
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+
+        for wr in wrs.iter() {
+            let w = &wr.wr;
+            unsafe {
+                (*qpx).wr_id = w.wr_id;
+                (*qpx).wr_flags = w.send_flags & !ffi::ibv_send_flags::IBV_SEND_INLINE.0;
+
+                match w.opcode {
+                    ffi::ibv_wr_opcode::IBV_WR_SEND => (*qpx).wr_send.unwrap()(qpx),
+                    ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM => {
+                        (*qpx).wr_send_imm.unwrap()(qpx, w.__bindgen_anon_1.imm_data)
+                    }
+                    ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE => {
+                        let rdma = w.wr.rdma;
+                        (*qpx).wr_rdma_write.unwrap()(qpx, rdma.rkey, rdma.remote_addr)
+                    }
+                    ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM => {
+                        let rdma = w.wr.rdma;
+                        (*qpx).wr_rdma_write_imm.unwrap()(
+                            qpx,
+                            rdma.rkey,
+                            rdma.remote_addr,
+                            w.__bindgen_anon_1.imm_data,
+                        )
+                    }
+                    ffi::ibv_wr_opcode::IBV_WR_RDMA_READ => {
+                        let rdma = w.wr.rdma;
+                        (*qpx).wr_rdma_read.unwrap()(qpx, rdma.rkey, rdma.remote_addr)
+                    }
+                    ffi::ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP => {
+                        let atomic = w.wr.atomic;
+                        (*qpx).wr_atomic_cmp_swp.unwrap()(
+                            qpx,
+                            atomic.rkey,
+                            atomic.remote_addr,
+                            atomic.compare_add,
+                            atomic.swap,
+                        )
+                    }
+                    ffi::ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD => {
+                        let atomic = w.wr.atomic;
+                        (*qpx).wr_atomic_fetch_add.unwrap()(
+                            qpx,
+                            atomic.rkey,
+                            atomic.remote_addr,
+                            atomic.compare_add,
+                        )
+                    }
+                    _ => {
+                        (*qpx).wr_abort.unwrap()(qpx);
+                        return Err(io::Error::from_raw_os_error(nix::libc::EINVAL));
+                    }
+                }
+
+                let sg_list = std::slice::from_raw_parts(w.sg_list, w.num_sge as usize);
+                if w.send_flags & ffi::ibv_send_flags::IBV_SEND_INLINE.0 != 0 {
+                    if let [sge] = sg_list {
+                        (*qpx).wr_set_inline_data.unwrap()(
+                            qpx,
+                            sge.addr as *mut c_void,
+                            sge.length as usize,
+                        );
+                    } else {
+                        let bufs: Vec<ffi::ibv_data_buf> = sg_list
+                            .iter()
+                            .map(|s| ffi::ibv_data_buf {
+                                addr: s.addr as *mut c_void,
+                                length: s.length as usize,
+                            })
+                            .collect();
+                        (*qpx).wr_set_inline_data_list.unwrap()(qpx, bufs.len(), bufs.as_ptr());
+                    }
+                } else {
+                    (*qpx).wr_set_sge_list.unwrap()(qpx, sg_list.len(), sg_list.as_ptr());
+                }
+            }
         }
-        wrs.last_mut().unwrap().wr.next = ptr::null_mut();
 
-        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null_mut();
-
-        // TODO:
-        //
-        // ibv_post_send()  posts the linked list of work requests (WRs) starting with wr to the
-        // send queue of the queue pair qp.  It stops processing WRs from this list at the first
-        // failure (that can  be  detected  immediately  while  requests  are  being posted), and
-        // returns this failing WR through bad_wr.
-        //
-        // The user should not alter or destroy AHs associated with WRs until request is fully
-        // executed and  a  work  completion  has been retrieved from the corresponding completion
-        // queue (CQ) to avoid unexpected behavior.
-        //
-        // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
-        // immediately after the call returns.
-
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe {
-            ops.post_send.as_mut().unwrap()(
-                self.qp,
-                &mut wrs[0].wr as *mut _,
-                &mut bad_wr as *mut _,
-            )
-        };
-        if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
+        let ret = unsafe { (*qpx).wr_complete.unwrap()(qpx) };
+        if ret != 0 {
+            Err(io::Error::from_raw_os_error(ret))
         } else {
             Ok(())
         }
