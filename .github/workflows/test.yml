@@ -52,7 +52,7 @@ jobs:
     # kernel source (the runner's own kernel ships only siw) and attaching it to the runner's
     # network interface, then run the ignored tests against it. Pinned to 22.04: its 6.8 kernel
     # builds a stable rxe module, whereas the ubuntu-latest kernel's rxe drops completions.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     name: ubuntu / stable / soft-roce
     steps:
       - uses: actions/checkout@v4
@@ -96,15 +96,8 @@ jobs:
       - name: cargo test -- --ignored
         env:
           IBVERBS_TEST_DEVICE: rxe0
-        # Run serially: the tests share one rxe device, and Soft-RoCE drops completions when many
-        # queue pairs drive it concurrently. The skipped tests exercise RC atomics and the UC/UD
-        # transports, which this kernel's Soft-RoCE does not implement correctly (they pass against
-        # real hardware and newer kernels); everything else gates the full RC data path.
-        run: |
-          cargo test --locked --test loopback -- --ignored --test-threads=1 \
-            --skip atomic_operations \
-            --skip unreliable_connection \
-            --skip unreliable_datagram
+        # PROBE: 6.17 serial, no skips, to see the true deterministic pass/fail set.
+        run: cargo test --locked --test loopback -- --ignored --test-threads=1
   minimal:
     # This action chooses the oldest version of the dependencies permitted by Cargo.toml to ensure
     # that this crate is compatible with the minimal version that this crate and its dependencies
