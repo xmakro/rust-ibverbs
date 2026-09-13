@@ -141,6 +141,9 @@ degrading to the legacy verbs.
 
 ## Documentation
 
+Release notes, and the guide for moving code from 0.9 to 0.10, live in
+[`CHANGELOG.md`](CHANGELOG.md).
+
 Much of the documentation of this crate borrows heavily from the excellent posts over at
 [RDMAmojo](http://www.rdmamojo.com/). If you are going to be working a lot with ibverbs, chances
 are you will want to head over there. In particular, [this overview
