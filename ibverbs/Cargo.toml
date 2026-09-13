@@ -1,6 +1,6 @@
 [package]
 name = "ibverbs"
-version = "0.9.2"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.82" # inherited from ibverbs-sys
 
@@ -24,7 +24,7 @@ license = "MIT OR Apache-2.0"
 all-features = true
 
 [dependencies]
-ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.3.0" }
+ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.4.0" }
 nix = { version = "0.31.3", default-features = false, features = ["fs", "poll"] }
 thiserror = "2.0"
 
